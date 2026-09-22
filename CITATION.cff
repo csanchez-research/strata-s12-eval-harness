@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this harness, please cite the accompanying paper."
+type: software
+title: "STRATA-S12 Evaluation Harness"
+authors:
+  - family-names: "Sanchez-Leon"
+    given-names: "Christian"
+  - family-names: "Chen"
+    given-names: "Dongming"
+  - family-names: "Wang"
+    given-names: "Dongqi"
+year: 2026
+license: "MIT"
+preferred-citation:
+  type: article
+  title: "Deficit-Driven Stratified Acquisition for Building STRATA-S12: An Open SAR-Optical Corpus for Self-Supervised Learning"
+  authors:
+    - family-names: "Sanchez-Leon"
+      given-names: "Christian"
+    - family-names: "Chen"
+      given-names: "Dongming"
+    - family-names: "Wang"
+      given-names: "Dongqi"
+  year: 2026

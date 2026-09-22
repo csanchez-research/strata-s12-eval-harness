@@ -1,0 +1,9 @@
+# Probe harness dependencies (pinned lockfile - paper Section 5.3)
+torch==2.4.1
+timm==1.0.11
+rasterio==1.4.2
+numpy==1.26.4
+pandas==2.2.3
+pyarrow==17.0.0
+scikit-learn==1.5.2
+matplotlib==3.9.2

@@ -1,0 +1,32 @@
+{
+  "band_order": [
+    "S2_B4",
+    "S2_B3",
+    "S2_B2",
+    "S1_VV",
+    "S1_VH",
+    "S1_VV_VH_DIFF"
+  ],
+  "band_means": [
+    2279.179427,
+    2030.035962,
+    1720.423176,
+    -13.4949,
+    -22.345413,
+    8.850514
+  ],
+  "band_stds": [
+    984.933512,
+    623.56091,
+    445.519466,
+    5.534698,
+    8.399451,
+    5.960437
+  ],
+  "n_samples": 13698,
+  "n_shards": 50,
+  "max_per_shard": null,
+  "source_glob": "/data/strata-s12-*.tar",
+  "computed_at": "2026-08-30T22:29:56.061885+00:00",
+  "note": "Chan parallel variance, float64. S2 in reflectance, S1 in dB."
+}

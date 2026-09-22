@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""
+build_shards.py — written by 08_build_shards.py, run on Windows.
+
+Reads the per-shard lists and writes the tars. Nothing is copied, linked or
+renamed on disk: tarfile takes the name a file should have inside the
+archive as an argument, so the source is read where it lies and the
+WebDataset key exists only in the archive.
+
+That is the whole point of doing it this way. The previous approach staged
+each shard by creating five hundred hard links under a name matching the
+key, tarring the directory and deleting it. It worked, but it created and
+destroyed eight hundred thousand directory entries on one volume, and NTFS
+does not compact a directory index when entries are removed: the links took
+4.5 seconds per shard at the start and 27 by the fifteen hundredth, and the
+throughput fell with them. Writing the names directly touches no directory
+at all.
+
+    python build_shards.py
+    python build_shards.py --only 01600 01601
+
+Safe to run repeatedly. Each shard is checked against its list first; one
+that already holds exactly what it should is skipped, and anything else is
+rebuilt from scratch. A tar interrupted mid-file cannot be appended to —
+tar has to seek to an end that is the broken part — so a shard that is
+short is not patched, it is replaced.
+"""
+
+# ruff: noqa
+#
+# This file is a template, not a program: the planner substitutes the values
+# below before writing it out. Checking it as source will flag them.
+from __future__ import annotations
+
+import argparse
+import tarfile
+import time
+from pathlib import Path
+
+# ---- filled in by the planner ----------------------------------------------
+SRC = r"{SRC}"
+OUT = r"{OUT}"
+LISTS = r"{LISTS}"
+VERIFIED = r"{VERIFIED}"
+MIN_FREE_GB = {MIN_FREE_GB}
+PREFIX = "{PREFIX}"
+# ----------------------------------------------------------------------------
+
+
+def entries(list_path: Path) -> list[tuple[str, str]]:
+    """(source path relative to SRC, name inside the archive)."""
+    out = []
+    for line in list_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        src, key = line.split("\t")
+        out.append((src, key))
+    return out
+
+
+def contents(tar_path: Path) -> set[str] | None:
+    """Names inside an archive, or None if it cannot be read whole.
+
+    A truncated tar lists what it managed to read and then raises, so the
+    exception is the signal — not the count, and not the exit status of an
+    external process.
+    """
+    if not tar_path.exists():
+        return None
+    try:
+        with tarfile.open(tar_path, "r:") as tf:
+            return {m.name for m in tf}
+    except Exception:
+        return None
+
+
+# --- deep validation --------------------------------------------------------
+# contents() only checks the NAMES inside the archive. A .tif that is present
+# and correctly named but holds corrupt bytes passes that check and is never
+# rebuilt. validate_tar() opens every .tif with rasterio so byte-level
+# corruption is caught. Used by --validate. Requires rasterio + numpy in the
+# Windows Python (pip install rasterio numpy); imported lazily so the plain
+# build path needs neither.
+
+EXPECTED_BANDS = 3  # per modality (S2:3, S1:3)
+EXPECTED_TILE = 512  # global_config.TILE_SIZE
+
+
+def validate_tar(tar_path: Path, deep: bool = True) -> list[str]:
+    """Open every .tif in the archive. Returns a list of problems (empty = OK).
+
+    'deep' also reads the raster and checks for NaN/inf. Without it, only the
+    header is opened (catches the unreadable/'driver' errors seen in practice).
+
+    Returns (problems, bad_keys): the human-readable list and the set of sample
+    keys (the atomic pair, s2+s1+json) that are affected, so a caller can drop
+    whole pairs and count by pair rather than by file.
+    """
+    import numpy as np
+    from rasterio.io import MemoryFile
+
+    if not tar_path.exists():
+        return ["missing"], set()
+
+    problems: list[str] = []
+    bad_keys: set[str] = set()
+    mods: dict[str, set[str]] = {}
+    try:
+        with tarfile.open(tar_path, "r:") as tf:
+            for member in tf:
+                if not member.name.endswith(".tif"):
+                    continue
+                base = member.name.rsplit("/", 1)[-1]
+                parts = base.split(".")
+                if len(parts) < 3:
+                    problems.append(f"bad name: {base}")
+                    continue
+                key, mod = parts[0], parts[1]
+                fh = tf.extractfile(member)
+                if fh is None:
+                    problems.append(f"no data: {base}")
+                    bad_keys.add(key)
+                    continue
+                raw = fh.read()
+                # cheap check first: an empty .tif (0 bytes, cut download) is
+                # corrupt without opening it. Only pay for rasterio if it passes.
+                if len(raw) == 0:
+                    problems.append(f"{base}: empty (0 bytes)")
+                    bad_keys.add(key)
+                    continue
+                try:
+                    with MemoryFile(raw) as mem, mem.open() as src:
+                        if src.count != EXPECTED_BANDS:
+                            problems.append(f"{base}: bands={src.count}")
+                            bad_keys.add(key)
+                        elif src.width != EXPECTED_TILE or src.height != EXPECTED_TILE:
+                            problems.append(f"{base}: tile={src.width}x{src.height}")
+                            bad_keys.add(key)
+                        elif src.dtypes[0] != "float32":
+                            problems.append(f"{base}: dtype={src.dtypes[0]}")
+                            bad_keys.add(key)
+                        elif deep and not np.isfinite(src.read()).all():
+                            problems.append(f"{base}: NaN/inf")
+                            bad_keys.add(key)
+                        else:
+                            mods.setdefault(key, set()).add(mod)
+                except Exception as exc:
+                    problems.append(f"{base}: unreadable {type(exc).__name__}")
+                    bad_keys.add(key)
+    except Exception as exc:
+        return [f"tar unreadable: {type(exc).__name__}: {exc}"], set()
+
+    for key, seen in mods.items():
+        missing = {"s1", "s2"} - seen
+        if missing:
+            problems.append(f"{key}: missing {','.join(sorted(missing))}")
+            bad_keys.add(key)
+    return problems, bad_keys
+
+
+def build(shard: str, force: bool = False) -> str:
+    """Build one shard if it is not already correct. Returns what happened."""
+    lst = Path(LISTS) / f"{shard}.txt"
+    tar_path = Path(OUT) / f"{PREFIX}-{shard}.tar"
+    marker = Path(VERIFIED) / f"{tar_path.name}.ok"
+
+    if marker.exists() and not force:
+        return "skipped"
+
+    want = entries(lst)
+    names = {key for _src, key in want}
+    have = contents(tar_path)
+    if have is not None and have == names:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        return "verified"
+
+    # Anything other than an exact match means rebuild. Appending to a
+    # partial archive is what produced "Could not seek to archive end".
+    tar_path.unlink(missing_ok=True)
+    marker.unlink(missing_ok=True)
+
+    tmp = tar_path.with_suffix(".tar.part")
+    tmp.unlink(missing_ok=True)
+    try:
+        # Eight-megabyte blocks, not tarfile's default sixteen kilobytes.
+        # Copying a gigabyte in sixteen-kilobyte pieces is sixty-five thousand
+        # read/write pairs and the syscall overhead dominates what should be a
+        # sequential copy: measured here at 135 MB/s against 450.
+        with tarfile.open(tmp, "w:", copybufsize=8 * 1024 * 1024) as tf:
+            for src, key in want:
+                # The header is filled in by hand rather than through add(),
+                # which stats the file, resolves its type, builds a TarInfo
+                # and then copies. Only the size and the time are recorded
+                # here, so a shard is one stat and one read per file.
+                #
+                # arcname is the whole trick either way: the file keeps its
+                # own name on disk and carries the WebDataset key only inside
+                # the archive, so nothing is renamed, copied or linked to
+                # build a shard.
+                path = Path(SRC) / src
+                st = path.stat()
+                info = tarfile.TarInfo(key)
+                info.size = st.st_size
+                info.mtime = int(st.st_mtime)
+                with path.open("rb") as fh:
+                    tf.addfile(info, fh)
+        tmp.replace(tar_path)
+    except Exception as exc:
+        tmp.unlink(missing_ok=True)
+        return f"failed: {exc}"
+
+    have = contents(tar_path)
+    if have != names:
+        return f"failed: wrote {0 if have is None else len(have)} of {len(names)}"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch()
+    return "built"
+
+
+def _list_path(shard: str) -> Path:
+    return Path(LISTS) / f"{shard}.txt"
+
+
+def _drop_pairs_from_list(shard: str, keys: set[str], reasons: dict) -> int:
+    """Remove every line of the given sample keys from the shard list, and log
+    what was removed to <shard>_errores.txt next to the list. Whole pairs go:
+    all lines whose archive name (2nd column) starts with 'KEY.' are dropped,
+    so s2.tif, s1.tif and json of a bad pair leave together.
+
+    Returns the number of lines removed.
+    """
+    lst = _list_path(shard)
+    err = Path(LISTS) / f"{shard}_errores.txt"
+    kept: list[str] = []
+    removed: list[str] = []
+
+    for line in lst.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        # line is "src\tKEY.sensor.ext"; the pair key is before the first dot
+        name = line.split("\t")[-1]
+        key = name.split(".")[0]
+        if key in keys:
+            removed.append(line)
+        else:
+            kept.append(line)
+
+    lst.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+    with err.open("a", encoding="utf-8") as ef:
+        ef.write(f"# discarded {len(keys)} pair(s) from {shard} at {stamp}\n")
+        for line in removed:
+            key = line.split("\t")[-1].split(".")[0]
+            why = reasons.get(key, "corrupt source")
+            ef.write(f"{line}\t# {why}\n")
+    return len(removed)
+
+
+def validate_and_repair(
+    shard: str, deep: bool, max_tries: int = 3, drop_threshold: int = 2
+) -> tuple[str, dict]:
+    """Validate one shard, rebuilding+revalidating up to max_tries if bad.
+
+    Removes the .ok marker up front (a marker means nothing until re-proven),
+    and only re-creates it once the shard passes. If the source itself is
+    unrecoverable after max_tries, the decision is by PAIR (the atomic sample,
+    s2+s1+json), counted within this shard:
+      - up to drop_threshold bad pairs -> drop them from the list, log to
+        <shard>_errores.txt, rebuild the shard without them, re-validate.
+      - more than drop_threshold -> STOP touching this shard and flag it, since
+        that many is not random noise and needs a look.
+
+    Returns (status, info) with status in
+    {'ok', 'repaired', 'dropped', 'needs_review', 'unrecoverable'}.
+    """
+    tar_path = Path(OUT) / f"{PREFIX}-{shard}.tar"
+    marker = Path(VERIFIED) / f"{tar_path.name}.ok"
+
+    marker.unlink(missing_ok=True)
+
+    problems, bad_keys = validate_tar(tar_path, deep=deep)
+    if not problems:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        return "ok", {}
+
+    # try a plain rebuild first: maybe the tar was bad, not the source
+    for attempt in range(1, max_tries + 1):
+        tar_path.unlink(missing_ok=True)
+        res = build(shard, force=True)
+        if res.startswith("failed"):
+            marker.unlink(missing_ok=True)
+            problems = [f"rebuild {res}"]
+            continue
+        problems, bad_keys = validate_tar(tar_path, deep=deep)
+        if not problems:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+            return "repaired", {}
+        marker.unlink(missing_ok=True)
+        print(
+            f"    {shard}: attempt {attempt}/{max_tries} still bad ({problems[0]})",
+            flush=True,
+        )
+
+    # still bad after max_tries -> the source is the problem. Decide by pair.
+    reasons = {}
+    for p in problems:
+        k = p.split(".")[0].split(":")[0].strip()
+        reasons[k] = p
+    n_bad_pairs = len(bad_keys)
+
+    if n_bad_pairs == 0:
+        # bad but no key isolated (e.g. whole tar unreadable): can't drop safely
+        return "unrecoverable", {"problems": problems, "n_bad_pairs": 0}
+
+    if n_bad_pairs > drop_threshold:
+        return "needs_review", {"problems": problems, "n_bad_pairs": n_bad_pairs}
+
+    # drop the bad pairs from the list, rebuild without them, re-validate
+    n_lines = _drop_pairs_from_list(shard, bad_keys, reasons)
+    tar_path.unlink(missing_ok=True)
+    res = build(shard, force=True)
+    if res.startswith("failed"):
+        marker.unlink(missing_ok=True)
+        return "unrecoverable", {
+            "problems": [f"rebuild after drop {res}"],
+            "n_bad_pairs": n_bad_pairs,
+        }
+    problems2, bad2 = validate_tar(tar_path, deep=deep)
+    if not problems2:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        return "dropped", {
+            "dropped_pairs": sorted(bad_keys),
+            "n_bad_pairs": n_bad_pairs,
+            "n_lines": n_lines,
+        }
+    marker.unlink(missing_ok=True)
+    return "unrecoverable", {"problems": problems2, "n_bad_pairs": len(bad2)}
+
+
+def _run_validate(shards: list[str], deep: bool, drop_threshold: int = 2) -> int:
+    """Validate every shard; auto-repair, or drop <=threshold bad pairs and
+    rebuild, or stop-and-flag a shard with more bad pairs than the threshold.
+    One command, closed loop. Keeps a running count of discarded pairs so the
+    corpus total can be corrected afterwards."""
+    try:
+        from tqdm import tqdm
+    except ImportError:
+
+        def tqdm(x, **k):  # fallback if tqdm is absent
+            return x
+
+    mode = "deep (NaN/inf)" if deep else "shallow (headers)"
+    print(
+        f"Validating {len(shards):,} shards - mode: {mode} - "
+        f"drop threshold: {drop_threshold} pair(s)/shard"
+    )
+    print("source :", SRC)
+    print("output :", OUT)
+    print()
+
+    n_ok = 0
+    repaired: list[str] = []
+    dropped: dict[str, list[str]] = {}  # shard -> list of dropped pair keys
+    needs_review: dict[str, int] = {}  # shard -> n_bad_pairs
+    unrecoverable: dict[str, list[str]] = {}
+    total_dropped_pairs = 0
+
+    bar = tqdm(shards, unit="shard", desc="Validating", dynamic_ncols=True)
+    for shard in bar:
+        status, info = validate_and_repair(
+            shard, deep=deep, drop_threshold=drop_threshold
+        )
+        if status == "ok":
+            n_ok += 1
+        elif status == "repaired":
+            repaired.append(shard)
+            tqdm.write(f"  REPAIRED  {shard}")
+        elif status == "dropped":
+            keys = info["dropped_pairs"]
+            dropped[shard] = keys
+            total_dropped_pairs += len(keys)
+            tqdm.write(
+                f"  DROPPED   {shard}: {len(keys)} pair(s) "
+                f"{','.join(keys)} -> rebuilt, see {shard}_errores.txt"
+            )
+        elif status == "needs_review":
+            needs_review[shard] = info["n_bad_pairs"]
+            tqdm.write(
+                f"  NEEDS REVIEW  {shard}: {info['n_bad_pairs']} bad "
+                f"pairs (> {drop_threshold}) - STOPPED, nothing changed"
+            )
+        else:
+            unrecoverable[shard] = info.get("problems", ["?"])
+            tqdm.write(f"  UNRECOVERABLE  {shard}: {unrecoverable[shard][0]}")
+        if hasattr(bar, "set_postfix"):
+            bar.set_postfix(
+                ok=n_ok,
+                fixed=len(repaired),
+                dropped=total_dropped_pairs,
+                review=len(needs_review),
+                dead=len(unrecoverable),
+            )
+
+    # ── summary ─────────────────────────────────────────────────────────────
+    print()
+    print(
+        f"OK: {n_ok:,} - repaired: {len(repaired):,} - "
+        f"shards with drops: {len(dropped):,} "
+        f"({total_dropped_pairs} pair(s) total) - "
+        f"needs review: {len(needs_review):,} - "
+        f"unrecoverable: {len(unrecoverable):,}"
+    )
+
+    if total_dropped_pairs:
+        print(
+            f"\nDISCARDED {total_dropped_pairs} pair(s). The corpus total drops "
+            f"by this many; update the paper/manifest/index. Per-shard detail "
+            f"in the *_errores.txt files under LISTS."
+        )
+        for shard, keys in dropped.items():
+            print(f"  {shard}: {len(keys)} - {','.join(keys)}")
+
+    if needs_review:
+        print(
+            f"\nNEEDS REVIEW - more than {drop_threshold} bad pairs, not "
+            f"touched (systematic problem?):"
+        )
+        for shard, n in needs_review.items():
+            print(f"  {shard}: {n} bad pairs")
+
+    if unrecoverable:
+        print("\nUNRECOVERABLE (could not isolate/rebuild):")
+        for shard, probs in unrecoverable.items():
+            print(f"  {shard}: {probs[0]}")
+
+    # non-zero exit if anything needs a human
+    return 1 if (needs_review or unrecoverable) else 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--only", nargs="*", help="build only these shard numbers")
+    ap.add_argument(
+        "--recheck",
+        action="store_true",
+        help="ignore the markers and verify every shard",
+    )
+    ap.add_argument(
+        "--validate",
+        action="store_true",
+        help="deep-check every .tif; delete+rebuild+recheck bad shards (3 tries). "
+        "Drops each .ok first and re-creates it only when the shard proves good.",
+    )
+    ap.add_argument(
+        "--shallow",
+        action="store_true",
+        help="with --validate: only open headers, skip the NaN/inf data read",
+    )
+    ap.add_argument(
+        "--drop-threshold",
+        type=int,
+        default=2,
+        help="with --validate: up to this many bad pairs in a shard are dropped "
+        "and the shard rebuilt without them; more than this stops and flags the "
+        "shard for review (default 2)",
+    )
+    args = ap.parse_args()
+
+    shards = sorted(
+        p.stem
+        for p in Path(LISTS).glob("*.txt")
+        if not p.stem.endswith("_errores")  # don't treat error logs as shards
+    )
+    if args.only:
+        shards = [s for s in shards if s in set(args.only)]
+    Path(OUT).mkdir(parents=True, exist_ok=True)
+    Path(VERIFIED).mkdir(parents=True, exist_ok=True)
+
+    if args.validate:
+        return _run_validate(
+            shards, deep=not args.shallow, drop_threshold=args.drop_threshold
+        )
+
+    marked = len(list(Path(VERIFIED).glob("*.ok")))
+    todo = len(shards) - (0 if args.recheck else marked)
+    print(f"{len(shards):,} shards, {marked:,} already verified")
+    # Printed as arguments, not interpolated: a Windows path inside an
+    # f-string turns its backslashes into escape sequences.
+    print("source :", SRC)
+    print("output :", OUT)
+    print()
+
+    t0 = time.monotonic()
+    recent: list[float] = []
+    done = built = failed = 0
+
+    for i, shard in enumerate(shards):
+        free_gb = __import__("shutil").disk_usage(OUT).free / 1024**3
+        if free_gb < MIN_FREE_GB:
+            print()
+            print(
+                f"STOPPED: {free_gb:,.1f} GB free on",
+                OUT,
+                "- point the planner at another disk and re-run.",
+            )
+            return 1
+
+        res = build(shard, force=args.recheck)
+        if res == "skipped":
+            continue
+
+        done += 1
+        if res == "built":
+            built += 1
+        elif res.startswith("failed"):
+            failed += 1
+            print(f"  {shard}: {res}", flush=True)
+
+        recent.append(time.monotonic())
+        if len(recent) > 10:
+            recent.pop(0)
+        rate = (
+            (len(recent) - 1) / (recent[-1] - recent[0]) * 3600
+            if len(recent) > 1 and recent[-1] > recent[0]
+            else 0
+        )
+        eta = (todo - done) / rate * 60 if rate else 0
+        print(
+            f"{time.strftime('%H:%M:%S')} [{i + 1}/{len(shards)}] "
+            f"{PREFIX}-{shard}  ({done}/{todo})  {rate:,.1f}/h  "
+            f"ETA {eta:,.0f} min",
+            flush=True,
+        )
+
+    mins = (time.monotonic() - t0) / 60
+    print()
+    print(f"built {built:,}, failed {failed:,}, in {mins:,.0f} min")
+    if failed:
+        print("Re-run to rebuild the failures; the rest are skipped.")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
