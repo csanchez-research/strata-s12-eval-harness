@@ -1,5 +1,7 @@
 # STRATA-S12 — Evaluation Harness
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22892250.svg)](https://doi.org/10.5281/zenodo.22892250)
+
 Evaluation harness and reproducibility layer for **STRATA-S12**, a paired
 Sentinel-1 (SAR) / Sentinel-2 (optical) corpus for self-supervised Earth
 observation. This repository does **not** contain the corpus or the acquisition
